@@ -8,6 +8,16 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+function slowEquals(a: string, b: string): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  
+  let result = 0;
+  for (let i = 0; i < a.length; i++) {
+      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return result === 0;
+}
+
 const authenticateToken = (
   req: Request,
   res: Response,
@@ -18,7 +28,7 @@ const authenticateToken = (
   if (!token) {
     return res.status(401).json({ error: "No token provided" });
   }
-  if (token !== process.env.ADMIN_TOKEN) {
+  if (!slowEquals(token, process.env.ADMIN_TOKEN as string)) {
     return res.status(403).json({ error: "Invalid token" });
   }
   next();
