@@ -359,19 +359,16 @@ app.delete(
 );
 
 app.post("/renew-cert", authenticateToken, async (req: Request, res: any) => {
-  const { domain } = req.body;
+  const { domain, force } = req.body;
+  const forceRenewal = force === true;
 
   if (!domain || !isValidDomain(domain)) {
     return res.status(400).json({ error: "Invalid domain" });
   }
 
   try {
-    await renewCert(domain);
-
-    return res.json({
-      status: "success",
-      message: `SSL certificate for ${domain} renewed successfully`,
-    });
+    const result = await renewCert(domain, forceRenewal);
+    return res.json(result);
   } catch (error: any) {
     return res.status(500).json({
       error: "Failed to renew certificate",
@@ -383,22 +380,43 @@ app.post("/renew-cert", authenticateToken, async (req: Request, res: any) => {
 app.get("/certificates", authenticateToken, async (req: Request, res: any) => {
   try {
     const domains = await getAllConfiguredDomains();
-    
+
     // Get info for all certificates in parallel
-    const certInfoPromises = domains.map(domain => getCertInfo(domain));
+    const certInfoPromises = domains.map((domain) => getCertInfo(domain));
     const certInfoResults = await Promise.all(certInfoPromises);
-    
+
     return res.json({
       status: "success",
-      certificates: certInfoResults
+      certificates: certInfoResults,
     });
   } catch (error: any) {
     return res.status(500).json({
       error: "Failed to get certificate information",
-      details: error.message
+      details: error.message,
     });
   }
 });
+
+app.post(
+  "/check-all-certs",
+  authenticateToken,
+  async (req: Request, res: any) => {
+    try {
+      // Respond immediately
+      res.json({
+        status: "started",
+        message: "Certificate renewal check started",
+      });
+
+      // Run the check in the background
+      checkAndRenewAllCerts().catch((error) => {
+        console.error("Error in background cert renewal:", error);
+      });
+    } catch (error: any) {
+      console.error("Error initiating cert renewal check:", error);
+    }
+  }
+);
 
 app.get("/health", (req: Request, res: Response) => {
   res.json({ status: "ok" });
