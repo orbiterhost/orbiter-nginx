@@ -108,6 +108,7 @@ server {
 }`;
 
 const renewCert = async (domain: string) => {
+  console.log("Domain: ", domain);
   try {
     await fs.access(`/etc/nginx/sites-available/${domain}`);
   } catch (error) {
