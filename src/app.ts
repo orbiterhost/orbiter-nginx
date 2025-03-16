@@ -10,10 +10,10 @@ app.use(express.json());
 
 function slowEquals(a: string, b: string): boolean {
   if (!a || !b || a.length !== b.length) return false;
-  
+
   let result = 0;
   for (let i = 0; i < a.length; i++) {
-      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return result === 0;
 }
@@ -106,6 +106,29 @@ server {
         proxy_ssl_verify off;
     }
 }`;
+
+const renewCert = async (domain: string) => {
+  try {
+    await fs.access(`/etc/nginx/sites-available/${domain}`);
+  } catch (error) {
+    console.log(error);
+    throw new Error("Domain configuration not found");
+  }
+
+  try {
+    await fs.mkdir("/var/www/certbot", { recursive: true });
+
+    await execCommand(
+      `certbot renew --cert-name ${domain} --force-renewal --non-interactive --webroot -w /var/www/certbot`
+    );
+
+    await execCommand("nginx -t");
+    await execCommand("nginx -s reload");
+  } catch (error: any) {
+    console.log(error);
+    throw new Error(error.message);
+  }
+};
 
 app.post(
   "/custom-domains",
@@ -203,6 +226,28 @@ app.delete(
     }
   }
 );
+
+app.post("/renew-cert", authenticateToken, async (req: Request, res: any) => {
+  const { domain } = req.body;
+
+  if (!domain || !isValidDomain(domain)) {
+    return res.status(400).json({ error: "Invalid domain" });
+  }
+
+  try {
+    await renewCert(domain);
+
+    return res.json({
+      status: "success",
+      message: `SSL certificate for ${domain} renewed successfully`,
+    });
+  } catch (error: any) {
+    return res.status(500).json({
+      error: "Failed to renew certificate",
+      details: error.message,
+    });
+  }
+});
 
 app.get("/health", (req: Request, res: Response) => {
   res.json({ status: "ok" });
