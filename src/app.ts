@@ -2,6 +2,7 @@ import express, { Express, Request, Response, NextFunction } from "express";
 import { exec } from "child_process";
 import fs from "fs/promises";
 import dotenv from "dotenv";
+import { CronJob } from "cron";
 
 dotenv.config();
 
@@ -107,29 +108,158 @@ server {
     }
 }`;
 
-const renewCert = async (domain: string) => {
-  console.log("Domain: ", domain);
+const needsRenewal = async (domain: string): Promise<boolean> => {
   try {
-    await fs.access(`/etc/nginx/sites-available/${domain}`);
-  } catch (error) {
-    console.log(error);
-    throw new Error("Domain configuration not found");
-  }
-
-  try {
-    await fs.mkdir("/var/www/certbot", { recursive: true });
-
-    await execCommand(
-      `certbot renew --cert-name ${domain} --force-renewal --non-interactive --webroot -w /var/www/certbot`
+    const result = await execCommand(
+      `certbot certificates --cert-name ${domain}`
     );
-
-    await execCommand("nginx -t");
-    await execCommand("nginx -s reload");
-  } catch (error: any) {
-    console.log(error);
-    throw new Error(error.message);
+    // Parse the expiry date from the output
+    const expiryMatch = result.match(/VALID: (\d+) days/);
+    if (expiryMatch && expiryMatch[1]) {
+      const daysRemaining = parseInt(expiryMatch[1], 10);
+      return daysRemaining <= 30; // Only renew if 30 days or less remaining
+    }
+    return false; // If we can't determine, assume no renewal needed
+  } catch (error) {
+    console.log(`Error checking cert expiry for ${domain}:`, error);
+    return false; // If check fails, assume no renewal needed
   }
 };
+
+const getCertInfo = async (domain: string): Promise<any> => {
+  try {
+    const result = await execCommand(
+      `certbot certificates --cert-name ${domain}`
+    );
+
+    // Parse expiry date
+    const expiryMatch = result.match(
+      /Expiry Date: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/
+    );
+    const daysMatch = result.match(/VALID: (\d+) days/);
+
+    if (expiryMatch && expiryMatch[1] && daysMatch && daysMatch[1]) {
+      return {
+        domain,
+        expiryDate: expiryMatch[1],
+        daysRemaining: parseInt(daysMatch[1], 10),
+        needsRenewal: parseInt(daysMatch[1], 10) <= 30,
+      };
+    }
+
+    return {
+      domain,
+      expiryDate: "Unknown",
+      daysRemaining: -1,
+      needsRenewal: false,
+      error: "Could not parse certificate information",
+    };
+  } catch (error: any) {
+    return {
+      domain,
+      expiryDate: "Unknown",
+      daysRemaining: -1,
+      needsRenewal: false,
+      error: error.message,
+    };
+  }
+};
+
+const renewCert = async (
+  domain: string,
+  forceRenewal = false
+): Promise<any> => {
+  console.log(`Checking certificate for ${domain}`);
+
+  try {
+    // Check if domain config exists
+    await fs.access(`/etc/nginx/sites-available/${domain}`);
+
+    // Check if renewal is needed
+    const shouldRenew = forceRenewal || (await needsRenewal(domain));
+
+    if (!shouldRenew) {
+      console.log(`Certificate for ${domain} doesn't need renewal yet`);
+      return {
+        status: "skipped",
+        message: `Certificate for ${domain} doesn't need renewal yet`,
+      };
+    }
+
+    console.log(`Renewing certificate for ${domain}`);
+
+    // Ensure webroot directory exists
+    await fs.mkdir("/var/www/certbot", { recursive: true });
+
+    // Renew the certificate
+    await execCommand(
+      `certbot renew --cert-name ${domain} --non-interactive --webroot -w /var/www/certbot`
+    );
+
+    // Test and reload NGINX
+    await execCommand("nginx -t");
+    await execCommand("nginx -s reload");
+
+    console.log(`Certificate for ${domain} renewed successfully`);
+    return {
+      status: "success",
+      message: `Certificate for ${domain} renewed successfully`,
+    };
+  } catch (error: any) {
+    console.error(`Error renewing certificate for ${domain}:`, error.message);
+    return {
+      status: "error",
+      message: `Error renewing certificate: ${error.message}`,
+    };
+  }
+};
+
+const getAllConfiguredDomains = async (): Promise<string[]> => {
+  try {
+    const files = await fs.readdir("/etc/nginx/sites-available");
+    // Filter out non-domain files if needed
+    return files.filter(
+      (file) =>
+        !file.includes("default") && !file.startsWith(".") && file.includes(".")
+    );
+  } catch (error) {
+    console.error("Error reading sites-available directory:", error);
+    return [];
+  }
+};
+
+const checkAndRenewAllCerts = async (): Promise<void> => {
+  console.log("Starting daily certificate renewal check...");
+
+  try {
+    const domains = await getAllConfiguredDomains();
+    console.log(`Found ${domains.length} domain(s) to check`);
+
+    for (const domain of domains) {
+      console.log(`Checking domain: ${domain}`);
+      const result = await renewCert(domain);
+      console.log(`Result for ${domain}:`, result.status);
+    }
+
+    console.log("Daily certificate renewal check completed");
+  } catch (error) {
+    console.error("Error during certificate renewal check:", error);
+  }
+};
+
+const setupCronJob = () => {
+  const job = new CronJob(
+    "30 2 * * *",
+    checkAndRenewAllCerts,
+    null,
+    true,
+    "UTC"
+  );
+  console.log("Cron job scheduled to run daily at 2:30 AM UTC");
+  return job;
+};
+
+let certRenewalJob: CronJob;
 
 app.post(
   "/custom-domains",
@@ -250,10 +380,39 @@ app.post("/renew-cert", authenticateToken, async (req: Request, res: any) => {
   }
 });
 
+app.get("/certificates", authenticateToken, async (req: Request, res: any) => {
+  try {
+    const domains = await getAllConfiguredDomains();
+    
+    // Get info for all certificates in parallel
+    const certInfoPromises = domains.map(domain => getCertInfo(domain));
+    const certInfoResults = await Promise.all(certInfoPromises);
+    
+    return res.json({
+      status: "success",
+      certificates: certInfoResults
+    });
+  } catch (error: any) {
+    return res.status(500).json({
+      error: "Failed to get certificate information",
+      details: error.message
+    });
+  }
+});
+
 app.get("/health", (req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
 app.listen(3000, () => {
   console.log("Domain manager listening on port 3000");
+  certRenewalJob = setupCronJob();
+});
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM signal received: stopping cron job");
+  if (certRenewalJob) {
+    certRenewalJob.stop();
+  }
+  process.exit(0);
 });
