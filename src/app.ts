@@ -48,11 +48,15 @@ const execCommand = (command: string): Promise<string> => {
   });
 };
 
-// Initial HTTP-only config
+// Updated config generation functions with bot protection
+
 const generateInitialConfig = (domain: string, subdomain: string) => `
 server {
     listen 80;
     server_name ${domain};
+    
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log /var/log/nginx/${domain}_error.log warn;
     
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -72,11 +76,13 @@ server {
     }
 }`;
 
-// Final config with SSL
 const generateFinalConfig = (domain: string, subdomain: string) => `
 server {
     listen 80;
     server_name ${domain};
+    
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log /var/log/nginx/${domain}_error.log warn;
     
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -92,10 +98,37 @@ server {
     server_name ${domain};
     resolver 8.8.8.8 valid=30s ipv6=off;
 
+    # Detailed logging
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log /var/log/nginx/${domain}_error.log warn;
+
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
+    # Block malicious scanners
+    if ($blocked_scanner) {
+        return 444;
+    }
+    
+    # Block unwanted bots
+    if ($blocked_bot) {
+        return 444;
+    }
+
+    # Block WordPress attacks (customers don't use WordPress)
+    location ~* /(wp-admin|wp-content|wp-login|phpmyadmin|xmlrpc\.php) {
+        return 444;
+    }
+    
+    # Block vulnerability scanning paths
+    location ~* /(actuator|auth/realms|webdav) {
+        return 444;
+    }
+
+    # Main location with rate limiting
     location / {
+        limit_req zone=general burst=40 nodelay;
+        
         proxy_pass https://${subdomain}.orbiter.website$request_uri;
         proxy_set_header Host ${subdomain}.orbiter.website;
         proxy_set_header X-Real-IP $remote_addr;
