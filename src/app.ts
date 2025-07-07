@@ -105,6 +105,10 @@ server {
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
 
+    # Bot Blocker includes
+    include /etc/nginx/bots.d/ddos.conf;
+    include /etc/nginx/bots.d/blockbots.conf;
+
     # Block malicious scanners
     if ($blocked_scanner) {
         return 444;
@@ -127,7 +131,7 @@ server {
 
     # Main location with rate limiting
     location / {
-        limit_req zone=general burst=40 nodelay;
+        limit_req zone=flood burst=40 nodelay;
         
         proxy_pass https://${subdomain}.orbiter.website$request_uri;
         proxy_set_header Host ${subdomain}.orbiter.website;
