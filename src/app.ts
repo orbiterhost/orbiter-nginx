@@ -22,15 +22,32 @@ const readDomainMappings = async (): Promise<DomainMapping[]> => {
     const content = await fs.readFile(DOMAIN_MAPPING_FILE, 'utf8');
     const mappings: DomainMapping[] = [];
     
-    // Parse the nginx map format
+    // Only parse the $backend_subdomain map (ignore $backend_host map)
     const lines = content.split('\n');
+    let inSubdomainMap = false;
+    
     for (const line of lines) {
-      const match = line.match(/^\s*"?([^"\s]+)"?\s+"?([^"\s]+)"?;?\s*$/);
-      if (match && !line.includes('map') && !line.includes('{') && !line.includes('}')) {
-        mappings.push({
-          domain: match[1],
-          subdomain: match[2]
-        });
+      if (line.includes('map $host $backend_subdomain')) {
+        inSubdomainMap = true;
+        continue;
+      }
+      if (line.includes('map $host $backend_host')) {
+        inSubdomainMap = false;
+        continue;
+      }
+      if (line.includes('}')) {
+        inSubdomainMap = false;
+        continue;
+      }
+      
+      if (inSubdomainMap) {
+        const match = line.match(/^\s*"?([^"\s]+)"?\s+"?([^"\s]+)"?;?\s*$/);
+        if (match && !line.includes('default')) {
+          mappings.push({
+            domain: match[1],
+            subdomain: match[2]
+          });
+        }
       }
     }
     
