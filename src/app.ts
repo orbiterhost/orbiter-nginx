@@ -8,6 +8,78 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// Domain mapping functions
+const DOMAIN_MAPPING_FILE = '/etc/nginx/conf.d/domain_mappings.conf';
+
+interface DomainMapping {
+  domain: string;
+  subdomain: string;
+}
+
+// Read current domain mappings
+const readDomainMappings = async (): Promise<DomainMapping[]> => {
+  try {
+    const content = await fs.readFile(DOMAIN_MAPPING_FILE, 'utf8');
+    const mappings: DomainMapping[] = [];
+    
+    // Parse the nginx map format
+    const lines = content.split('\n');
+    for (const line of lines) {
+      const match = line.match(/^\s*"?([^"\s]+)"?\s+"?([^"\s]+)"?;?\s*$/);
+      if (match && !line.includes('map') && !line.includes('{') && !line.includes('}')) {
+        mappings.push({
+          domain: match[1],
+          subdomain: match[2]
+        });
+      }
+    }
+    
+    return mappings;
+  } catch (error) {
+    // File doesn't exist yet, return empty array
+    return [];
+  }
+};
+
+// Write domain mappings to nginx map file
+const writeDomainMappings = async (mappings: DomainMapping[]) => {
+  const content = `# Auto-generated domain mappings
+# This file maps customer domains to their corresponding subdomains
+
+map $host $backend_subdomain {
+    default "";
+${mappings.map(m => `    "${m.domain}" "${m.subdomain}";`).join('\n')}
+}
+
+map $host $backend_host {
+    default "";
+${mappings.map(m => `    "${m.domain}" "${m.subdomain}.orbiter.website";`).join('\n')}
+}`;
+
+  await fs.writeFile(DOMAIN_MAPPING_FILE, content);
+};
+
+// Add a domain mapping
+const addDomainMapping = async (domain: string, subdomain: string) => {
+  const mappings = await readDomainMappings();
+  
+  // Remove existing mapping for this domain if it exists
+  const filtered = mappings.filter(m => m.domain !== domain);
+  
+  // Add new mapping
+  filtered.push({ domain, subdomain });
+  
+  await writeDomainMappings(filtered);
+};
+
+// Remove a domain mapping
+const removeDomainMapping = async (domain: string) => {
+  const mappings = await readDomainMappings();
+  const filtered = mappings.filter(m => m.domain !== domain);
+  await writeDomainMappings(filtered);
+};
+
+// Helper functions
 function slowEquals(a: string, b: string): boolean {
   if (!a || !b || a.length !== b.length) return false;
   
@@ -48,104 +120,7 @@ const execCommand = (command: string): Promise<string> => {
   });
 };
 
-// Updated config generation functions with bot protection
-
-const generateInitialConfig = (domain: string, subdomain: string) => `
-server {
-    listen 80;
-    server_name ${domain};
-    
-    access_log /var/log/nginx/${domain}_access.log;
-    error_log /var/log/nginx/${domain}_error.log warn;
-    
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        proxy_pass https://${subdomain}.orbiter.website$request_uri;
-        proxy_set_header Host ${subdomain}.orbiter.website;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Original-Host $host;
-        
-        proxy_ssl_server_name on;
-        proxy_ssl_protocols TLSv1.2 TLSv1.3;
-        proxy_ssl_verify off;
-    }
-}`;
-
-const generateFinalConfig = (domain: string, subdomain: string) => `
-server {
-    listen 80;
-    server_name ${domain};
-    
-    access_log /var/log/nginx/${domain}_access.log;
-    error_log /var/log/nginx/${domain}_error.log warn;
-    
-    location /.well-known/acme-challenge/ {
-        root /var/www/certbot;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    server_name ${domain};
-    resolver 8.8.8.8 valid=30s ipv6=off;
-
-    # Detailed logging
-    access_log /var/log/nginx/${domain}_access.log;
-    error_log /var/log/nginx/${domain}_error.log warn;
-
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-
-    # Bot Blocker includes
-    include /etc/nginx/bots.d/ddos.conf;
-    include /etc/nginx/bots.d/blockbots.conf;
-
-    # Block malicious scanners
-    if ($blocked_scanner) {
-        return 444;
-    }
-    
-    # Block unwanted bots
-    if ($blocked_bot) {
-        return 444;
-    }
-
-    # Block WordPress attacks (customers don't use WordPress)
-    location ~* /(wp-admin|wp-content|wp-login|phpmyadmin|xmlrpc\.php) {
-        return 444;
-    }
-    
-    # Block vulnerability scanning paths
-    location ~* /(actuator|auth/realms|webdav) {
-        return 444;
-    }
-
-    # Main location with rate limiting
-    location / {
-        limit_req zone=flood burst=40 nodelay;
-        
-        proxy_pass https://${subdomain}.orbiter.website$request_uri;
-        proxy_set_header Host ${subdomain}.orbiter.website;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Original-Host $host;
-        
-        proxy_ssl_server_name on;
-        proxy_ssl_protocols TLSv1.2 TLSv1.3;
-        proxy_ssl_verify off;
-    }
-}`;
-
+// NEW PROXY-ONLY APPROACH
 app.post(
   "/custom-domains",
   authenticateToken,
@@ -162,46 +137,26 @@ app.post(
     }
 
     try {
-      // Create certbot webroot directory
-      await fs.mkdir("/var/www/certbot", { recursive: true });
-
-      // 1. First deploy HTTP-only config
-      const configPath = `/etc/nginx/sites-available/${domain}`;
-      await fs.writeFile(configPath, generateInitialConfig(domain, subdomain));
-
-      // Setup symlink
-      try {
-        await fs.unlink(`/etc/nginx/sites-enabled/${domain}`);
-      } catch (error) {
-        // Ignore if doesn't exist
-      }
-      await fs.symlink(configPath, `/etc/nginx/sites-enabled/${domain}`);
-
-      // Test and reload NGINX
-      await execCommand("nginx -t");
-      await execCommand("nginx -s reload");
-
-      // 2. Get SSL certificate
-      await execCommand(
-        `certbot certonly --webroot -w /var/www/certbot -d ${domain} --non-interactive --agree-tos --email launchorbiter@gmail.com --verbose`
-      );
-
-      // 3. Deploy final config with SSL
-      await fs.writeFile(configPath, generateFinalConfig(domain, subdomain));
-
-      // 4. Final test and reload
+      // Add domain mapping to proxy system
+      await addDomainMapping(domain, subdomain);
+      
+      // Reload nginx to pick up new mapping
       await execCommand("nginx -t");
       await execCommand("nginx -s reload");
 
       res.json({
         status: "success",
-        message: "Domain configured successfully with SSL",
+        message: "Domain mapping added successfully",
+        instructions: [
+          `Point ${domain} CNAME record to proxy.orbiter.website`,
+          "If you can't use CNAME, use A record to proxy.orbiter.website's IP",
+          "Domain will be served through Cloudflare protection"
+        ]
       });
     } catch (error: any) {
       // Cleanup on error
       try {
-        await fs.unlink(`/etc/nginx/sites-available/${domain}`);
-        await fs.unlink(`/etc/nginx/sites-enabled/${domain}`);
+        await removeDomainMapping(domain);
       } catch (cleanupError) {
         // Ignore cleanup errors
       }
@@ -214,29 +169,47 @@ app.post(
   }
 );
 
-// Rest of the code remains the same...
-
 app.delete(
   "/custom-domains",
   authenticateToken,
   async (req: Request, res: any) => {
     const { domain } = req.body;
+    
     try {
-      await execCommand(
-        `certbot delete --cert-name ${domain} --non-interactive`
-      );
-      await fs.unlink(`/etc/nginx/sites-enabled/${domain}`);
-      await fs.unlink(`/etc/nginx/sites-available/${domain}`);
+      // Remove domain mapping
+      await removeDomainMapping(domain);
+      
+      // Reload nginx
       await execCommand("nginx -t");
-      await execCommand("systemctl reload nginx");
+      await execCommand("nginx -s reload");
 
       res.json({
         status: "success",
-        message: "Domain configuration removed successfully",
+        message: "Domain mapping removed successfully",
       });
     } catch (error: any) {
       res.status(500).json({
-        error: "Failed to remove domain configuration",
+        error: "Failed to remove domain mapping",
+        details: error.message,
+      });
+    }
+  }
+);
+
+// View current mappings
+app.get(
+  "/custom-domains",
+  authenticateToken,
+  async (req: Request, res: any) => {
+    try {
+      const mappings = await readDomainMappings();
+      res.json({
+        status: "success",
+        mappings: mappings
+      });
+    } catch (error: any) {
+      res.status(500).json({
+        error: "Failed to read domain mappings",
         details: error.message,
       });
     }
