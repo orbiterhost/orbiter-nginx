@@ -8,95 +8,20 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-// Domain mapping functions
-const DOMAIN_MAPPING_FILE = '/etc/nginx/conf.d/domain_mappings.conf';
+// Cloudflare API configuration
+const CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4';
 
-interface DomainMapping {
-  domain: string;
-  subdomain: string;
+interface CloudflareCustomHostname {
+  id: string;
+  hostname: string;
+  ssl: {
+    status: string;
+    method: string;
+    type: string;
+  };
+  status: string;
 }
 
-// Read current domain mappings
-const readDomainMappings = async (): Promise<DomainMapping[]> => {
-  try {
-    const content = await fs.readFile(DOMAIN_MAPPING_FILE, 'utf8');
-    const mappings: DomainMapping[] = [];
-    
-    // Only parse the $backend_subdomain map (ignore $backend_host map)
-    const lines = content.split('\n');
-    let inSubdomainMap = false;
-    
-    for (const line of lines) {
-      if (line.includes('map $host $backend_subdomain')) {
-        inSubdomainMap = true;
-        continue;
-      }
-      if (line.includes('map $host $backend_host')) {
-        inSubdomainMap = false;
-        continue;
-      }
-      if (line.includes('}')) {
-        inSubdomainMap = false;
-        continue;
-      }
-      
-      if (inSubdomainMap) {
-        const match = line.match(/^\s*"?([^"\s]+)"?\s+"?([^"\s]+)"?;?\s*$/);
-        if (match && !line.includes('default')) {
-          mappings.push({
-            domain: match[1],
-            subdomain: match[2]
-          });
-        }
-      }
-    }
-    
-    return mappings;
-  } catch (error) {
-    // File doesn't exist yet, return empty array
-    return [];
-  }
-};
-
-// Write domain mappings to nginx map file
-const writeDomainMappings = async (mappings: DomainMapping[]) => {
-  const content = `# Auto-generated domain mappings
-# This file maps customer domains to their corresponding subdomains
-
-map $host $backend_subdomain {
-    default "";
-${mappings.map(m => `    "${m.domain}" "${m.subdomain}";`).join('\n')}
-}
-
-map $host $backend_host {
-    default "";
-${mappings.map(m => `    "${m.domain}" "${m.subdomain}.orbiter.website";`).join('\n')}
-}`;
-
-  await fs.writeFile(DOMAIN_MAPPING_FILE, content);
-};
-
-// Add a domain mapping
-const addDomainMapping = async (domain: string, subdomain: string) => {
-  const mappings = await readDomainMappings();
-  
-  // Remove existing mapping for this domain if it exists
-  const filtered = mappings.filter(m => m.domain !== domain);
-  
-  // Add new mapping
-  filtered.push({ domain, subdomain });
-  
-  await writeDomainMappings(filtered);
-};
-
-// Remove a domain mapping
-const removeDomainMapping = async (domain: string) => {
-  const mappings = await readDomainMappings();
-  const filtered = mappings.filter(m => m.domain !== domain);
-  await writeDomainMappings(filtered);
-};
-
-// Helper functions
 function slowEquals(a: string, b: string): boolean {
   if (!a || !b || a.length !== b.length) return false;
   
@@ -137,7 +62,168 @@ const execCommand = (command: string): Promise<string> => {
   });
 };
 
-// NEW PROXY-ONLY APPROACH
+// Cloudflare for SaaS functions
+async function createCloudflareCustomHostname(domain: string): Promise<CloudflareCustomHostname> {
+  const response = await fetch(`${CLOUDFLARE_API_BASE}/zones/${process.env.CLOUDFLARE_ZONE_ID}/custom_hostnames`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      hostname: domain,
+      ssl: {
+        method: 'http',
+        type: 'dv',
+        settings: {
+          http2: 'on',
+          min_tls_version: '1.2',
+          tls_1_3: 'on'
+        }
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Cloudflare API error: ${error}`);
+  }
+
+  const result = await response.json();
+  
+  if (!result.success) {
+    throw new Error(`Cloudflare error: ${result.errors?.[0]?.message || 'Unknown error'}`);
+  }
+
+  return result.result;
+}
+
+async function getCustomHostnameStatus(customHostnameId: string): Promise<CloudflareCustomHostname> {
+  const response = await fetch(`${CLOUDFLARE_API_BASE}/zones/${process.env.CLOUDFLARE_ZONE_ID}/custom_hostnames/${customHostnameId}`, {
+    headers: {
+      'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+    }
+  });
+  
+  const data = await response.json();
+  return data.result;
+}
+
+async function waitForSSLValidation(customHostnameId: string, maxAttempts = 60): Promise<boolean> {
+  console.log(`Waiting for SSL validation for custom hostname: ${customHostnameId}`);
+  
+  for (let i = 0; i < maxAttempts; i++) {
+    const customHostname = await getCustomHostnameStatus(customHostnameId);
+    const sslStatus = customHostname.ssl.status;
+    
+    console.log(`Attempt ${i + 1}: SSL Status = ${sslStatus}`);
+    
+    if (sslStatus === 'active') {
+      console.log('SSL validation successful!');
+      return true;
+    }
+    
+    if (sslStatus === 'failed') {
+      throw new Error('SSL validation failed');
+    }
+    
+    // Wait 5 seconds before checking again
+    await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+  
+  throw new Error('SSL validation timeout after 5 minutes');
+}
+
+async function deleteCloudflareCustomHostname(customHostnameId: string): Promise<void> {
+  const response = await fetch(`${CLOUDFLARE_API_BASE}/zones/${process.env.CLOUDFLARE_ZONE_ID}/custom_hostnames/${customHostnameId}`, {
+    method: 'DELETE',
+    headers: {
+      'Authorization': `Bearer ${process.env.CLOUDFLARE_API_TOKEN}`,
+    }
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to delete Cloudflare custom hostname: ${error}`);
+  }
+}
+
+// Simplified nginx config generation (no SSL needed - Cloudflare handles it)
+const generateCloudflareProxyConfig = (domain: string, subdomain: string) => `
+server {
+    listen 80;
+    server_name ${domain};
+    
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log /var/log/nginx/${domain}_error.log warn;
+    
+    # Trust Cloudflare IPs and get real visitor IP
+    real_ip_header CF-Connecting-IP;
+    real_ip_recursive on;
+    
+    # Cloudflare IP ranges (add all current ranges)
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 104.16.0.0/13;
+    set_real_ip_from 104.24.0.0/14;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 131.0.72.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 2400:cb00::/32;
+    set_real_ip_from 2606:4700::/32;
+    set_real_ip_from 2803:f800::/32;
+    set_real_ip_from 2405:b500::/32;
+    set_real_ip_from 2405:8100::/32;
+    set_real_ip_from 2a06:98c0::/29;
+    set_real_ip_from 2c0f:f248::/32;
+
+    # Block malicious scanners (your existing bot protection still applies)
+    location ~* /(wp-admin|wp-content|wp-login|phpmyadmin|xmlrpc\.php) {
+        return 444;
+    }
+    
+    location ~* /(actuator|auth/realms|webdav) {
+        return 444;
+    }
+
+    location / {
+        # Rate limiting (can be more relaxed since Cloudflare handles DDoS)
+        limit_req zone=flood burst=40 nodelay;
+        
+        proxy_pass https://${subdomain}.orbiter.website$request_uri;
+        proxy_set_header Host ${subdomain}.orbiter.website;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Original-Host $host;
+        
+        # Pass through Cloudflare headers to your worker
+        proxy_set_header CF-Ray $http_cf_ray;
+        proxy_set_header CF-Visitor $http_cf_visitor;
+        proxy_set_header CF-Connecting-IP $http_cf_connecting_ip;
+        proxy_set_header CF-IPCountry $http_cf_ipcountry;
+        proxy_set_header CF-IPCity $http_cf_ipcity;
+        
+        proxy_ssl_server_name on;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_ssl_verify off;
+        
+        # Timeouts
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}`;
+
+// Updated custom domains endpoint with Cloudflare for SaaS
 app.post(
   "/custom-domains",
   authenticateToken,
@@ -153,29 +239,74 @@ app.post(
       return res.status(400).json({ error: "Invalid domain or subdomain" });
     }
 
+    let cloudflareCustomHostname: CloudflareCustomHostname | null = null;
+
     try {
-      // Add domain mapping to proxy system
-      await addDomainMapping(domain, subdomain);
-      
-      // Reload nginx to pick up new mapping
+      console.log(`Setting up custom domain: ${domain} -> ${subdomain}.orbiter.website`);
+
+      // 1. Create Cloudflare Custom Hostname (this handles SSL automatically)
+      console.log('Creating Cloudflare custom hostname...');
+      cloudflareCustomHostname = await createCloudflareCustomHostname(domain);
+      console.log(`Custom hostname created with ID: ${cloudflareCustomHostname.id}`);
+
+      // 2. Create simplified nginx config (no SSL needed, Cloudflare handles it)
+      const configPath = `/etc/nginx/sites-available/${domain}`;
+      await fs.writeFile(configPath, generateCloudflareProxyConfig(domain, subdomain));
+      console.log('Nginx config written');
+
+      // 3. Setup symlink
+      try {
+        await fs.unlink(`/etc/nginx/sites-enabled/${domain}`);
+      } catch (error) {
+        // Ignore if doesn't exist
+      }
+      await fs.symlink(configPath, `/etc/nginx/sites-enabled/${domain}`);
+      console.log('Nginx symlink created');
+
+      // 4. Test and reload NGINX
       await execCommand("nginx -t");
       await execCommand("nginx -s reload");
+      console.log('Nginx reloaded successfully');
+
+      // 5. Wait for Cloudflare SSL validation (this can take a few minutes)
+      console.log('Waiting for Cloudflare SSL validation...');
+      await waitForSSLValidation(cloudflareCustomHostname.id);
+
+      // 6. Get final status
+      const finalStatus = await getCustomHostnameStatus(cloudflareCustomHostname.id);
 
       res.json({
         status: "success",
-        message: "Domain mapping added successfully",
-        instructions: [
-          `Point ${domain} CNAME record to proxy.orbiter.website`,
-          "If you can't use CNAME, use A record to proxy.orbiter.website's IP",
-          "Domain will be served through Cloudflare protection"
-        ]
+        message: "Domain configured successfully with Cloudflare protection",
+        cloudflare: {
+          custom_hostname_id: cloudflareCustomHostname.id,
+          ssl_status: finalStatus.ssl.status,
+          hostname_status: finalStatus.status
+        },
+        dns_instructions: {
+          type: "CNAME",
+          name: domain,
+          target: cloudflareCustomHostname.hostname,
+          note: "Customer needs to create this CNAME record in their DNS"
+        }
       });
+
     } catch (error: any) {
+      console.error('Domain setup error:', error);
+      
       // Cleanup on error
       try {
-        await removeDomainMapping(domain);
+        // Remove nginx config
+        await fs.unlink(`/etc/nginx/sites-available/${domain}`);
+        await fs.unlink(`/etc/nginx/sites-enabled/${domain}`);
+        await execCommand("nginx -s reload");
+        
+        // Remove Cloudflare custom hostname if it was created
+        if (cloudflareCustomHostname) {
+          await deleteCloudflareCustomHostname(cloudflareCustomHostname.id);
+        }
       } catch (cleanupError) {
-        // Ignore cleanup errors
+        console.error('Cleanup error:', cleanupError);
       }
 
       res.status(500).json({
@@ -186,57 +317,107 @@ app.post(
   }
 );
 
+// Updated delete endpoint with Cloudflare cleanup
 app.delete(
   "/custom-domains",
   authenticateToken,
   async (req: Request, res: any) => {
-    const { domain } = req.body;
+    const { domain, cloudflare_custom_hostname_id } = req.body;
     
+    if (!domain) {
+      return res.status(400).json({ error: "Domain is required" });
+    }
+
     try {
-      // Remove domain mapping
-      await removeDomainMapping(domain);
-      
-      // Reload nginx
+      console.log(`Removing custom domain: ${domain}`);
+
+      // 1. Remove Cloudflare custom hostname (if ID provided)
+      if (cloudflare_custom_hostname_id) {
+        try {
+          await deleteCloudflareCustomHostname(cloudflare_custom_hostname_id);
+          console.log('Cloudflare custom hostname deleted');
+        } catch (cfError) {
+          console.error('Error deleting Cloudflare custom hostname:', cfError);
+          // Continue with nginx cleanup even if Cloudflare fails
+        }
+      } else {
+        console.log('No Cloudflare custom hostname ID provided, skipping CF cleanup');
+      }
+
+      // 2. Remove nginx configuration
+      try {
+        await fs.unlink(`/etc/nginx/sites-enabled/${domain}`);
+        await fs.unlink(`/etc/nginx/sites-available/${domain}`);
+        console.log('Nginx config files removed');
+      } catch (nginxError) {
+        console.error('Error removing nginx files:', nginxError);
+        // Continue anyway
+      }
+
+      // 3. Test and reload nginx
       await execCommand("nginx -t");
       await execCommand("nginx -s reload");
+      console.log('Nginx reloaded');
 
       res.json({
         status: "success",
-        message: "Domain mapping removed successfully",
+        message: "Domain configuration removed successfully",
       });
+
     } catch (error: any) {
+      console.error('Domain removal error:', error);
       res.status(500).json({
-        error: "Failed to remove domain mapping",
+        error: "Failed to remove domain configuration",
         details: error.message,
       });
     }
   }
 );
 
-// View current mappings
-app.get(
-  "/custom-domains",
-  authenticateToken,
-  async (req: Request, res: any) => {
-    try {
-      const mappings = await readDomainMappings();
-      res.json({
-        status: "success",
-        mappings: mappings
-      });
-    } catch (error: any) {
-      res.status(500).json({
-        error: "Failed to read domain mappings",
-        details: error.message,
-      });
-    }
-  }
-);
-
+// Health check endpoint
 app.get("/health", (req: Request, res: Response) => {
   res.json({ status: "ok" });
 });
 
+// Optional: Get status of a custom hostname
+app.get(
+  "/custom-domains/:domain/status",
+  authenticateToken,
+  async (req: Request, res: any) => {
+    const { domain } = req.params;
+    const { cloudflare_custom_hostname_id } = req.query;
+
+    if (!cloudflare_custom_hostname_id) {
+      return res.status(400).json({ error: "cloudflare_custom_hostname_id is required" });
+    }
+
+    try {
+      const status = await getCustomHostnameStatus(cloudflare_custom_hostname_id as string);
+      res.json({
+        domain,
+        cloudflare_status: status
+      });
+    } catch (error: any) {
+      res.status(500).json({
+        error: "Failed to get domain status",
+        details: error.message,
+      });
+    }
+  }
+);
+
 app.listen(3000, () => {
   console.log("Domain manager listening on port 3000");
+  console.log("Cloudflare for SaaS integration enabled");
+  
+  // Check required environment variables
+  const requiredEnvVars = ['ADMIN_TOKEN', 'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ZONE_ID'];
+  const missingVars = requiredEnvVars.filter(varName => !process.env[varName]);
+  
+  if (missingVars.length > 0) {
+    console.error('Missing required environment variables:', missingVars);
+    console.error('Please set these in your .env file');
+  } else {
+    console.log('All required environment variables are set');
+  }
 });
